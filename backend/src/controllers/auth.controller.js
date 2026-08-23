@@ -1,9 +1,9 @@
 import { supabase, supabaseAdmin } from "../config/supabase.js";
-import { sendOtpEmail, sendPasswordResetEmail,sendLoginEmail } from "../services/email.service.js";
+import { sendOtpEmail, sendPasswordResetEmail, sendLoginEmail } from "../services/email.service.js";
 import { generateOtp, hashOtp } from "../utils/otp.js";
 import { signAccessToken, signRefreshToken } from "../utils/jwt.js";
 
-// OTPs are valid for 10 minutes. Emails are sent in the background
+// OTPs are valid for 45 seconds. Emails are sent in the background
 // (see the *Async helpers below), so this needs real headroom -
 // it must not be shorter than realistic email delivery time.
 const OTP_TTL_MS = 45 * 1000;
@@ -35,6 +35,16 @@ const sendPasswordResetEmailAsync = (email, resetLink) => {
     );
   });
 };
+
+const sendLoginEmailAsync = (email, name) => {
+  sendLoginEmail(email, name).catch((error) => {
+    console.error(
+      `❌ Background login email failed for ${email}:`,
+      error.message
+    );
+  });
+};
+
 export const register = async (req, res) => {
   try {
     const {
@@ -510,7 +520,7 @@ export const resendOtp = async (req, res) => {
 
     const otpHash = hashOtp(otp);
 
-    // OTP expires in 10 minutes
+    // OTP expires in 45 seconds
     const expiresAt = new Date(
       Date.now() + OTP_TTL_MS
     );
@@ -665,17 +675,16 @@ export const login = async (req, res) => {
 
     const accessToken = signAccessToken(jwtPayload);
     const refreshToken = signRefreshToken(jwtPayload);
-    try {
-        await sendLoginEmail(
-          data.user.email,
-          profile.name
-        );
-      } catch (emailError) {
-        console.error(
-          "Background login email failed:",
-          emailError.message
-        );  
-      }
+
+    // --------------------------------
+    // Send login notification (background)
+    // --------------------------------
+    // Don't make the client wait on Gmail - tokens are already
+    // issued, so respond immediately and let the email go out
+    // asynchronously. Failures are logged server-side only.
+
+    sendLoginEmailAsync(data.user.email, profile.name);
+
     return res.status(200).json({
       success: true,
       message: "Login successful",
