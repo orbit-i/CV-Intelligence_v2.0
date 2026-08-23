@@ -1,5 +1,22 @@
 import nodemailer from "nodemailer";
 
+/* =========================================
+   TRANSPORTER (pooled + persistent)
+
+   IMPORTANT: this file assumes a long-running
+   Node process (Express/Fastify server, worker,
+   etc). The transporter is created once at
+   module load and reused for every send — that's
+   what makes pooling actually work.
+
+   If this ever runs in a serverless environment
+   (Vercel/Lambda/Cloud Functions), pooling gives
+   little benefit because each invocation can get
+   a fresh container, and you should switch to an
+   HTTP-based provider (Resend/SES/Postmark)
+   instead of SMTP.
+========================================= */
+
 const transporter = nodemailer.createTransport({
   service: "gmail",
 
@@ -8,31 +25,207 @@ const transporter = nodemailer.createTransport({
     pass: process.env.GMAIL_APP_PASSWORD
   },
 
-  // Reuse SMTP connections instead of doing a fresh TLS handshake
-  // + login on every single send. This is the single biggest lever
-  // for cutting per-email latency once the pool is warm.
   pool: true,
   maxConnections: 5,
   maxMessages: 100,
 
+  rateDelta: 1000,
+  rateLimit: 5,
+
   connectionTimeout: 30000,
   greetingTimeout: 30000,
-  socketTimeout: 3000
+  socketTimeout: 20000
 });
 
-const BRAND = "Orbit";
+const BRAND = "CV-Intelligence";
 const BRAND_COLOR = "#4F46E5";
 const FROM = `"${BRAND}" <${process.env.GMAIL_USER}>`;
 
+// Verify once at startup, not per-send.
+transporter
+  .verify()
+  .then(() => console.log("✅ Gmail SMTP connected"))
+  .catch((error) =>
+    console.error("❌ Gmail SMTP connection failed:", error.message)
+  );
+
+/* =========================================
+   SEND QUEUE (in-memory, lightweight)
+
+   Purpose: callers never `await` a send inline
+   in a request handler. Instead they call
+   `queueEmail(fn, args)`, which returns
+   immediately. The actual send happens in the
+   background with retry + backoff, so a slow or
+   flaky Gmail response never blocks the HTTP
+   response to your user.
+
+   This is intentionally simple (no Redis/BullMQ
+   dependency). For high volume or delivery
+   guarantees across restarts, swap this for a
+   real queue — the call sites below don't change.
+========================================= */
+
+const MAX_RETRIES = 2;
+const RETRY_BASE_DELAY_MS = 1000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function sendWithRetry(sendFn, args) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await sendFn(...args);
+    } catch (error) {
+      lastError = error;
+      const isLastAttempt = attempt === MAX_RETRIES;
+
+      console.error(
+        `❌ Email send failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}):`,
+        error.message
+      );
+
+      if (!isLastAttempt) {
+        await sleep(RETRY_BASE_DELAY_MS * (attempt + 1));
+      }
+    }
+  }
+
+  console.error("❌ Email permanently failed after retries:", lastError.message);
+  // Hook point: push to a dead-letter table, alert on-call, etc.
+  throw lastError;
+}
+
+/**
+ * Fire-and-forget helper. Returns immediately; the actual
+ * send + retries happen in the background. Use this from
+ * request handlers so email latency never blocks the response.
+ *
+ * @param {(...args: any[]) => Promise<any>} sendFn - one of the send* functions below
+ * @param {any[]} args - arguments to pass to sendFn
+ * @param {(error: Error) => void} [onError] - optional failure callback (logging/alerting)
+ */
+export function queueEmail(sendFn, args, onError) {
+  sendWithRetry(sendFn, args).catch((error) => {
+    if (onError) onError(error);
+  });
+}
+
+/* =========================================
+   RESPONSIVE / CROSS-CLIENT EMAIL WRAPPER
+========================================= */
+
 const emailWrapper = (contentHtml) => `
 <!DOCTYPE html>
-<html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="color-scheme" content="light">
+  <meta name="supported-color-schemes" content="light">
   <title>${BRAND}</title>
+  <!--[if mso]>
+  <noscript>
+    <xml>
+      <o:OfficeDocumentSettings>
+        <o:PixelsPerInch>96</o:PixelsPerInch>
+      </o:OfficeDocumentSettings>
+    </xml>
+  </noscript>
+  <style>
+    table, td { font-family: Arial, Helvetica, sans-serif !important; }
+  </style>
+  <![endif]-->
+  <style>
+    body, table, td { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
+    img { border: 0; outline: none; text-decoration: none; }
+
+    :root { color-scheme: light; supported-color-schemes: light; }
+    @media (prefers-color-scheme: dark) {
+      .email-bg   { background:#f4f4f7 !important; }
+      .email-card { background:#ffffff !important; }
+      body, p, span, td, div { color: inherit; }
+    }
+
+    .email-container {
+      width: 600px;
+      max-width: 600px;
+    }
+
+    .email-content {
+      padding: 32px !important;
+    }
+
+    .otp-code {
+      font-size: 34px !important;
+      letter-spacing: 10px !important;
+    }
+
+    .btn-fallback { display: none !important; mso-hide: all; }
+    .btn {
+      display: inline-block !important;
+      width: auto !important;
+    }
+
+    @media only screen and (max-width: 768px) {
+      .email-container {
+        width: 92% !important;
+        max-width: 92% !important;
+      }
+    }
+
+    @media only screen and (max-width: 480px) {
+      .email-container {
+        width: 100% !important;
+        max-width: 100% !important;
+        border-radius: 0 !important;
+      }
+
+      .email-content {
+        padding: 24px 20px !important;
+      }
+
+      .email-header {
+        padding: 20px 20px !important;
+      }
+
+      .email-footer {
+        padding: 16px 20px !important;
+      }
+
+      .otp-code {
+        font-size: 26px !important;
+        letter-spacing: 5px !important;
+      }
+
+      .btn {
+        display: block !important;
+        width: 100% !important;
+        box-sizing: border-box;
+        text-align: center !important;
+      }
+
+      h1, h2 {
+        font-size: 20px !important;
+      }
+    }
+
+    @media only screen and (max-width: 360px) {
+      .otp-code {
+        font-size: 22px !important;
+        letter-spacing: 3px !important;
+      }
+
+      .email-content {
+        padding: 18px 14px !important;
+      }
+    }
+  </style>
 </head>
 
-<body style="
+<body class="email-bg" style="
   margin:0;
   padding:0;
   background:#f4f4f7;
@@ -44,31 +237,37 @@ const emailWrapper = (contentHtml) => `
   width="100%"
   cellpadding="0"
   cellspacing="0"
-  style="background:#f4f4f7;padding:40px 0;"
+  class="email-bg"
+  style="background:#f4f4f7;padding:40px 12px;"
 >
   <tr>
     <td align="center">
 
+      <!--[if mso]>
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" align="center">
+      <tr>
+      <td>
+      <![endif]-->
+
       <table
         role="presentation"
-        width="480"
+        class="email-container email-card"
+        width="600"
         cellpadding="0"
         cellspacing="0"
         style="
           background:#ffffff;
           border-radius:12px;
           overflow:hidden;
+          margin:0 auto;
         "
       >
 
-        <!-- Header -->
-
         <tr>
-          <td style="
+          <td class="email-header" style="
             background:${BRAND_COLOR};
             padding:24px 32px;
           ">
-
             <span style="
               font-size:20px;
               font-weight:bold;
@@ -76,27 +275,21 @@ const emailWrapper = (contentHtml) => `
             ">
               ${BRAND}
             </span>
-
           </td>
         </tr>
 
-        <!-- Content -->
-
         <tr>
-          <td style="padding:32px;">
+          <td class="email-content" style="padding:32px;">
             ${contentHtml}
           </td>
         </tr>
 
-        <!-- Footer -->
-
         <tr>
-          <td style="
+          <td class="email-footer" style="
             padding:20px 32px;
             background:#fafafa;
             border-top:1px solid #eee;
           ">
-
             <p style="
               margin:0;
               font-size:12px;
@@ -106,11 +299,16 @@ const emailWrapper = (contentHtml) => `
               © ${new Date().getFullYear()} ${BRAND}.
               This is an automated message.
             </p>
-
           </td>
         </tr>
 
       </table>
+
+      <!--[if mso]>
+      </td>
+      </tr>
+      </table>
+      <![endif]-->
 
     </td>
   </tr>
@@ -120,62 +318,49 @@ const emailWrapper = (contentHtml) => `
 </html>
 `;
 
-
-/* =========================================
-   VERIFY SMTP
-========================================= */
-
-transporter.verify()
-  .then(() => {
-    console.log("✅ Gmail SMTP connected");
-  })
-  .catch((error) => {
-    console.error(
-      "❌ Gmail SMTP connection failed:",
-      error.message
-    );
-  });
-
+const bulletproofButton = (href, label) => `
+<!--[if mso]>
+<v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="${href}" style="height:48px;v-text-anchor:middle;width:220px;" arcsize="16%" fillcolor="${BRAND_COLOR}" stroke="f">
+<w:anchorlock/>
+<center style="color:#ffffff;font-family:Arial,sans-serif;font-size:15px;font-weight:bold;">${label}</center>
+</v:roundrect>
+<![endif]-->
+<!--[if !mso]><!-->
+<a
+  href="${href}"
+  class="btn"
+  style="
+    display:inline-block;
+    padding:14px 32px;
+    background:${BRAND_COLOR};
+    color:#ffffff;
+    text-decoration:none;
+    font-weight:bold;
+    border-radius:8px;
+    font-size:15px;
+    mso-hide:all;
+  "
+>
+  ${label}
+</a>
+<!--<![endif]-->
+`;
 
 /* =========================================
    SEND OTP EMAIL
 ========================================= */
 
-export const sendOtpEmail = async (
-  email,
-  otp,
-  name
-) => {
-
-  try {
-
-    console.log("📧 Sending OTP email...");
-    console.log("To:", email);
-
-    const content = `
-
-      <h2 style="
-        margin:0 0 16px;
-        color:#111;
-        font-size:22px;
-      ">
+export const sendOtpEmail = async (email, otp, name) => {
+  const content = `
+      <h2 style="margin:0 0 16px; color:#111; font-size:22px;">
         Verify your email
       </h2>
 
-      <p style="
-        margin:0 0 8px;
-        color:#444;
-        font-size:15px;
-      ">
+      <p style="margin:0 0 8px; color:#444; font-size:15px;">
         Hello ${name},
       </p>
 
-      <p style="
-        margin:0 0 24px;
-        color:#444;
-        font-size:15px;
-        line-height:1.5;
-      ">
+      <p style="margin:0 0 24px; color:#444; font-size:15px; line-height:1.5;">
         Thanks for creating an account with ${BRAND}.
         Use the verification code below.
       </p>
@@ -188,8 +373,7 @@ export const sendOtpEmail = async (
         text-align:center;
         margin-bottom:24px;
       ">
-
-        <div style="
+        <div class="otp-code" style="
           font-family:'Courier New',Courier,monospace;
           font-size:34px;
           font-weight:bold;
@@ -199,189 +383,84 @@ export const sendOtpEmail = async (
           ${otp}
         </div>
 
-        <p style="
-          margin:10px 0 0;
-          font-size:12px;
-          color:#888;
-        ">
+        <p style="margin:10px 0 0; font-size:12px; color:#888;">
           This code expires in 45 seconds.
         </p>
-
       </div>
 
-      <p style="
-        margin:0;
-        font-size:13px;
-        color:#999;
-      ">
+      <p style="margin:0; font-size:13px; color:#999;">
         If you didn't create this account,
         you can safely ignore this email.
       </p>
-
     `;
 
-    const info = await transporter.sendMail({
+  const info = await transporter.sendMail({
+    from: FROM,
+    to: email,
+    subject: "Verify your email address",
+    html: emailWrapper(content)
+  });
 
-      from: FROM,
-
-      to: email,
-
-      subject: "Verify your email address",
-
-      html: emailWrapper(content)
-
-    });
-
-    console.log(
-      "✅ OTP email sent:",
-      info.messageId
-    );
-
-    return info;
-
-  } catch (error) {
-
-    console.error(
-      "❌ OTP email error:",
-      error.message
-    );
-
-    throw error;
-  }
+  console.log("✅ OTP email sent:", info.messageId);
+  return info;
 };
-
 
 /* =========================================
    SEND PASSWORD RESET EMAIL
 ========================================= */
 
-export const sendPasswordResetEmail = async (
-  email,
-  resetLink
-) => {
-
-  try {
-
-    console.log(
-      "📧 Sending password reset email..."
-    );
-
-    const content = `
-
-      <h2 style="
-        margin:0 0 16px;
-        color:#111;
-        font-size:22px;
-      ">
+export const sendPasswordResetEmail = async (email, resetLink) => {
+  const content = `
+      <h2 style="margin:0 0 16px; color:#111; font-size:22px;">
         Reset your password
       </h2>
 
-      <p style="
-        margin:0 0 24px;
-        color:#444;
-        font-size:15px;
-        line-height:1.5;
-      ">
+      <p style="margin:0 0 24px; color:#444; font-size:15px; line-height:1.5;">
         We received a request to reset your
         ${BRAND} account password.
       </p>
 
-      <div style="
-        text-align:center;
-        margin-bottom:24px;
-      ">
-
-        <a
-          href="${resetLink}"
-          style="
-            display:inline-block;
-            padding:14px 32px;
-            background:${BRAND_COLOR};
-            color:#ffffff;
-            text-decoration:none;
-            font-weight:bold;
-            border-radius:8px;
-            font-size:15px;
-          "
-        >
-          Reset Password
-        </a>
-
+      <div style="text-align:center; margin-bottom:24px;">
+        ${bulletproofButton(resetLink, "Reset Password")}
       </div>
 
-      <p style="
-        margin:0;
-        font-size:13px;
-        color:#999;
-      ">
+      <p style="margin:0; font-size:13px; color:#999;">
         If you didn't request this,
         you can safely ignore this email.
       </p>
-
     `;
 
-    const info = await transporter.sendMail({
+  const info = await transporter.sendMail({
+    from: FROM,
+    to: email,
+    subject: "Reset Your Password",
+    html: emailWrapper(content)
+  });
 
-      from: FROM,
-
-      to: email,
-
-      subject: "Reset Your Password",
-
-      html: emailWrapper(content)
-
-    });
-
-    console.log(
-      "✅ Password reset email sent:",
-      info.messageId
-    );
-
-    return info;
-
-  } catch (error) {
-
-    console.error(
-      "❌ Password reset email error:",
-      error.message
-    );
-
-    throw error;
-  }
+  console.log("✅ Password reset email sent:", info.messageId);
+  return info;
 };
-
 
 /* =========================================
    SEND LOGIN NOTIFICATION EMAIL
 ========================================= */
 
 export const sendLoginEmail = async (email, name) => {
-  try {
-    console.log("📧 Sending login notification email...");
-    console.log("To:", email);
+  const loginDate = new Date().toLocaleDateString("en-GB", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric"
+  });
 
-    const loginDate = new Date().toLocaleDateString("en-GB", {
-      day: "2-digit",
-      month: "2-digit",
-      year: "numeric"
-    });
+  const loginTime = new Date().toLocaleTimeString("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  });
 
-    const loginTime = new Date().toLocaleTimeString("en-GB", {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false
-    });
-
-    const content = `
-
-      <!-- Welcome -->
-
-      <div style="
-        text-align:center;
-        margin-bottom:28px;
-      ">
-
+  const content = `
+      <div style="text-align:center; margin-bottom:28px;">
         <div style="
           width:64px;
           height:64px;
@@ -397,53 +476,23 @@ export const sendLoginEmail = async (email, name) => {
           ✓
         </div>
 
-        <h1 style="
-          margin:0;
-          color:#111827;
-          font-size:24px;
-          font-weight:700;
-        ">
+        <h1 style="margin:0; color:#111827; font-size:24px; font-weight:700;">
           Login Successful
         </h1>
 
-        <p style="
-          margin:8px 0 0;
-          color:#6b7280;
-          font-size:14px;
-        ">
+        <p style="margin:8px 0 0; color:#6b7280; font-size:14px;">
           Your account was successfully accessed
         </p>
-
       </div>
 
-
-      <!-- Greeting -->
-
-      <p style="
-        margin:0 0 10px;
-        color:#333;
-        font-size:15px;
-      ">
-
+      <p style="margin:0 0 10px; color:#333; font-size:15px;">
         Dear ${name || "Customer"},
-
       </p>
 
-
-      <p style="
-        margin:0 0 24px;
-        color:#555;
-        font-size:14px;
-        line-height:1.7;
-      ">
-
+      <p style="margin:0 0 24px; color:#555; font-size:14px; line-height:1.7;">
         You have successfully logged on to
         <strong>${BRAND}</strong>.
-
       </p>
-
-
-      <!-- Login Information Card -->
 
       <table
         width="100%"
@@ -456,13 +505,8 @@ export const sendLoginEmail = async (email, name) => {
           margin-bottom:25px;
         "
       >
-
         <tr>
-
-          <td style="
-            padding:18px 20px;
-          ">
-
+          <td style="padding:18px 20px;">
             <p style="
               margin:0 0 14px;
               color:#6b7280;
@@ -473,181 +517,29 @@ export const sendLoginEmail = async (email, name) => {
               Login Details
             </p>
 
-
-            <p style="
-              margin:0 0 10px;
-              color:#333;
-              font-size:14px;
-            ">
-              <strong>Date:</strong>
-              ${loginDate}
+            <p style="margin:0 0 10px; color:#333; font-size:14px;">
+              <strong>Date:</strong> ${loginDate}
             </p>
 
-
-            <p style="
-              margin:0 0 10px;
-              color:#333;
-              font-size:14px;
-            ">
-              <strong>Time:</strong>
-              ${loginTime}
+            <p style="margin:0 0 10px; color:#333; font-size:14px;">
+              <strong>Time:</strong> ${loginTime}
             </p>
 
-
-            <p style="
-              margin:0;
-              color:#333;
-              font-size:14px;
-            ">
-              <strong>Account:</strong>
-              ${email}
+            <p style="margin:0; color:#333; font-size:14px; word-break:break-all;">
+              <strong>Account:</strong> ${email}
             </p>
-
           </td>
-
         </tr>
-
       </table>
-
-
-      <!-- Security Message -->
-
-      <div style="
-        background:#eef2ff;
-        border-left:4px solid ${BRAND_COLOR};
-        padding:16px 18px;
-        margin-bottom:25px;
-      ">
-
-        <p style="
-          margin:0 0 7px;
-          color:#111827;
-          font-size:14px;
-          font-weight:bold;
-        ">
-          Security Notice
-        </p>
-
-        <p style="
-          margin:0;
-          color:#4b5563;
-          font-size:13px;
-          line-height:1.6;
-        ">
-          If this login was performed by you,
-          no further action is required.
-          If you did not perform this login,
-          please secure your account immediately.
-        </p>
-
-      </div>
-
-
-      <!-- Important Notice -->
-
-      <div style="
-        border-top:1px solid #eeeeee;
-        padding-top:20px;
-      ">
-
-        <p style="
-          margin:0 0 8px;
-          color:#333;
-          font-size:12px;
-          font-weight:bold;
-        ">
-          Important Notice:
-        </p>
-
-        <p style="
-          margin:0;
-          color:#777;
-          font-size:11px;
-          line-height:1.6;
-        ">
-          ${BRAND} will never ask for your password,
-          OTP, or other security information through
-          email, SMS, or phone.
-        </p>
-
-      </div>
-
-
-      <!-- Support -->
-
-      <p style="
-        margin:22px 0 0;
-        color:#555;
-        font-size:13px;
-        line-height:1.6;
-      ">
-
-        For more information or assistance,
-        please contact ${BRAND} support.
-
-      </p>
-
-
-      <!-- Signature -->
-
-      <p style="
-        margin:20px 0 0;
-        color:#222;
-        font-size:14px;
-        font-weight:bold;
-      ">
-
-        ${BRAND}
-
-      </p>
-
-
-      <!-- Disclaimer -->
-
-      <div style="
-        margin-top:25px;
-        padding-top:18px;
-        border-top:1px solid #eeeeee;
-      ">
-
-        <p style="
-          margin:0;
-          color:#999;
-          font-size:10px;
-          line-height:1.6;
-        ">
-
-          <strong>Disclaimer:</strong>
-          This is an automated security notification
-          intended solely for the account holder.
-          If you received this email in error, please
-          disregard it. Please do not share your password,
-          OTP, or other confidential account information.
-
-        </p>
-
-      </div>
-
     `;
 
-
-    // =========================================
-    // SEND EMAIL
-    // =========================================
-
-    const info = await transporter.sendMail({
-
-      from: FROM,
-
-      to: email,
-
-      replyTo: process.env.GMAIL_USER,
-
-      subject: `${BRAND} - Successful Login`,
-
-      html: emailWrapper(content),
-
-      text: `
+  const info = await transporter.sendMail({
+    from: FROM,
+    to: email,
+    replyTo: process.env.GMAIL_USER,
+    subject: `${BRAND} - Successful Login`,
+    html: emailWrapper(content),
+    text: `
 Dear ${name || "Customer"},
 
 You have successfully logged on to ${BRAND}.
@@ -655,50 +547,9 @@ You have successfully logged on to ${BRAND}.
 Date: ${loginDate}
 Time: ${loginTime}
 Account: ${email}
+    `
+  });
 
-If this login was performed by you, no further action is required.
-
-If you did not perform this login, please secure your account immediately.
-
-Important Notice:
-${BRAND} will never ask for your password, OTP, or other security information through email, SMS, or phone.
-
-${BRAND}
-
-This is an automated security notification.
-      `
-    });
-
-
-    console.log(
-      "✅ Login notification email sent:",
-      info.messageId
-    );
-
-    console.log(
-      "📨 Accepted:",
-      info.accepted
-    );
-
-    console.log(
-      "📨 Rejected:",
-      info.rejected
-    );
-
-    console.log(
-      "📨 Response:",
-      info.response
-    );
-
-    return info;
-
-  } catch (error) {
-
-    console.error(
-      "❌ Login notification email error:",
-      error.message
-    );
-
-    throw error;
-  }
+  console.log("✅ Login notification email sent:", info.messageId);
+  return info;
 };
