@@ -11,6 +11,8 @@ import {
   getMe,
 } from "../controllers/auth.controller.js";
 
+import { sendLoginEmail } from "../services/email.service.js";
+
 import { requireAuth } from "../middleware/auth.middleware.js";
 import {
   registerLimiter,
@@ -21,6 +23,23 @@ import {
 } from "../middleware/rateLimiter.middleware.js";
 
 const router = express.Router();
+
+// --------------------------------------------------------
+// Fire-and-forget helper for OAuth login notifications.
+//
+// OAuth callbacks redirect the browser immediately - they
+// must not wait on Gmail's SMTP round trip before sending
+// the user back to the frontend. Failures are logged only.
+// --------------------------------------------------------
+
+const sendOAuthLoginEmailAsync = (email, name, provider) => {
+  sendLoginEmail(email, name).catch((error) => {
+    console.error(
+      `❌ Background ${provider} login email failed for ${email}:`,
+      error.message
+    );
+  });
+};
 
 /**
  * @swagger
@@ -74,6 +93,10 @@ router.get(
   }),
   (req, res) => {
     const user = req.user;
+
+    // Send login notification in the background - do not make
+    // the redirect wait on Gmail's SMTP round trip.
+    sendOAuthLoginEmailAsync(user.email, user.name, "Google");
 
     const params = new URLSearchParams({
       userId: user.id,
@@ -138,6 +161,10 @@ router.get(
   }),
   (req, res) => {
     const user = req.user;
+
+    // Send login notification in the background - do not make
+    // the redirect wait on Gmail's SMTP round trip.
+    sendOAuthLoginEmailAsync(user.email, user.name, "Microsoft");
 
     const params = new URLSearchParams({
       userId: user.id,
